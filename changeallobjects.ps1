@@ -51,10 +51,8 @@ $ChangeMax = $null
 
 if ($designateChangeRange.ToUpper() -eq "YES") {
     $UseChangeRange = $true
-
     $ChangeMin = [int](Read-Host "Enter the LOWEST existing object number to change")
     $ChangeMax = [int](Read-Host "Enter the HIGHEST existing object number to change")
-
     Write-Host "Only existing values numbered $ChangeMin through $ChangeMax will be changed."
 }
 
@@ -96,6 +94,8 @@ $ObjectTypes = @("AV", "BV", "AI", "BI", "AO", "BO")
 $Pattern = '(?i)\b(?<Type>AV|BV|AI|BI|AO|BO)-(?<Number>\d+)\b'
 
 $ObjectMap = @{}
+$ExistingObjects = @{}
+$AssignedNewObjects = @{}
 $Counters = @{}
 
 foreach ($type in $ObjectTypes) {
@@ -108,9 +108,37 @@ $folder = [System.IO.Path]::GetDirectoryName($VisioFile)
 $baseName = [System.IO.Path]::GetFileNameWithoutExtension($VisioFile)
 
 $backupFile = Join-Path $folder "$baseName`_BACKUP_$timestamp.vsdx"
-$tempFolder = Join-Path $env:TEMP "VisioObjectRenumber_$timestamp"
+$tempRoot = [System.IO.Path]::GetTempPath()
+$tempFolder = Join-Path $tempRoot "VisioObjectRenumber_$timestamp"
 $newFile = Join-Path $folder "$baseName`_RENAMED_$timestamp.vsdx"
 $mapFile = Join-Path $folder "ObjectRenumberMap_$timestamp.csv"
+
+function Is-Reserved-Microset {
+    param (
+        [string]$Type,
+        [int]$Number
+    )
+
+    $Type = $Type.ToUpper()
+
+    if (-not $ReserveMicrosetsEnabled) {
+        return $false
+    }
+
+    if ($Type -eq "AV" -and $Number -ge 90 -and $Number -le 110) {
+        return $true
+    }
+
+    if ($Type -eq "BV" -and $Number -eq 40) {
+        return $true
+    }
+
+    if ($Type -eq "BV" -and $Number -ge 64 -and $Number -le 87) {
+        return $true
+    }
+
+    return $false
+}
 
 function Should-Skip-Object {
     param (
@@ -120,22 +148,10 @@ function Should-Skip-Object {
 
     $Type = $Type.ToUpper()
 
-    # Reserve microset setpoints
-    if ($ReserveMicrosetsEnabled) {
-        if ($Type -eq "AV" -and $Number -ge 90 -and $Number -le 110) {
-            return $true
-        }
-
-        if ($Type -eq "BV" -and $Number -eq 40) {
-            return $true
-        }
-
-        if ($Type -eq "BV" -and $Number -ge 64 -and $Number -le 87) {
-            return $true
-        }
+    if (Is-Reserved-Microset -Type $Type -Number $Number) {
+        return $true
     }
 
-    # Optional existing-value range filter
     if ($UseChangeRange) {
         if ($Number -lt $ChangeMin -or $Number -gt $ChangeMax) {
             return $true
@@ -143,6 +159,63 @@ function Should-Skip-Object {
     }
 
     return $false
+}
+
+function Add-All-Existing-Objects {
+    param (
+        [string]$Text
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) {
+        return
+    }
+
+    $matches = [regex]::Matches($Text, $Pattern)
+
+    foreach ($match in $matches) {
+        $type = $match.Groups["Type"].Value.ToUpper()
+        $number = [int]$match.Groups["Number"].Value
+        $value = "$type-$number"
+
+        if (-not $ExistingObjects.ContainsKey($value)) {
+            $ExistingObjects[$value] = $true
+        }
+    }
+}
+
+function Get-Next-Available-Value {
+    param (
+        [string]$Type,
+        [string]$OldValue
+    )
+
+    $Type = $Type.ToUpper()
+
+    while ($true) {
+        if ($UseAssignEnd -and $Counters[$Type] -gt $AssignEnd) {
+            throw "Assignment range exceeded for $Type. Not enough available numbers between $AssignStart and $AssignEnd."
+        }
+
+        $candidateNumber = $Counters[$Type]
+        $candidateValue = "$Type-$candidateNumber"
+
+        $existsAlready = $ExistingObjects.ContainsKey($candidateValue)
+        $alreadyAssigned = $AssignedNewObjects.ContainsKey($candidateValue)
+        $isReserved = Is-Reserved-Microset -Type $Type -Number $candidateNumber
+
+        if (
+            (-not $existsAlready -or $candidateValue -eq $OldValue) -and
+            (-not $alreadyAssigned) -and
+            (-not $isReserved)
+        ) {
+            $AssignedNewObjects[$candidateValue] = $true
+            $Counters[$Type]++
+            return $candidateValue
+        }
+
+        Write-Host "Skipping $candidateValue because it already exists or is reserved."
+        $Counters[$Type]++
+    }
 }
 
 function Add-Objects-ToMap {
@@ -166,14 +239,8 @@ function Add-Objects-ToMap {
         }
 
         if (-not $ObjectMap.ContainsKey($oldValue)) {
-
-            if ($UseAssignEnd -and $Counters[$type] -gt $AssignEnd) {
-                throw "Assignment range exceeded for $type. Not enough available numbers between $AssignStart and $AssignEnd."
-            }
-
-            $newValue = "$type-$($Counters[$type])"
+            $newValue = Get-Next-Available-Value -Type $type -OldValue $oldValue
             $ObjectMap[$oldValue] = $newValue
-            $Counters[$type]++
         }
     }
 }
@@ -215,7 +282,7 @@ try {
     [System.IO.Compression.ZipFile]::ExtractToDirectory($VisioFile, $tempFolder)
 
     Write-Host ""
-    Write-Host "Scanning XML for object values..."
+    Write-Host "Scanning XML files..."
 
     $xmlFiles = Get-ChildItem $tempFolder -Recurse -File |
         Where-Object {
@@ -223,13 +290,25 @@ try {
         } |
         Sort-Object FullName
 
+    Write-Host "Building list of all existing AV/BV/AI/BI/AO/BO values..."
+
+    foreach ($file in $xmlFiles) {
+        $content = [System.IO.File]::ReadAllText($file.FullName)
+        Add-All-Existing-Objects -Text $content
+    }
+
+    Write-Host "Existing object values found: $($ExistingObjects.Count)"
+
+    Write-Host ""
+    Write-Host "Creating renumbering map..."
+
     foreach ($file in $xmlFiles) {
         $content = [System.IO.File]::ReadAllText($file.FullName)
         Add-Objects-ToMap -Text $content
     }
 
     Write-Host ""
-    Write-Host "Unique objects found for renumbering: $($ObjectMap.Count)"
+    Write-Host "Unique objects selected for renumbering: $($ObjectMap.Count)"
 
     if ($ObjectMap.Count -eq 0) {
         Write-Host ""
@@ -318,10 +397,17 @@ catch {
     Write-Host $_.Exception.Message -ForegroundColor Red
 }
 finally {
-    if (Test-Path $tempFolder) {
-        Remove-Item $tempFolder -Recurse -Force -ErrorAction SilentlyContinue
+    Write-Host ""
+
+    try {
+        if ([System.IO.Directory]::Exists($tempFolder)) {
+            [System.IO.Directory]::Delete($tempFolder, $true)
+        }
+    }
+    catch {
+        Write-Host "Temporary extraction folder could not be removed."
+        Write-Host $tempFolder
     }
 
-    Write-Host ""
     Write-Host "Script finished."
 }
