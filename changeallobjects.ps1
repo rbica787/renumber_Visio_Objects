@@ -26,6 +26,70 @@ if ($continue -ne "YES") {
     exit
 }
 
+# ------------------------------------------------------------
+# USER OPTIONS
+# ------------------------------------------------------------
+
+Write-Host ""
+$reserveMicrosets = Read-Host "Reserve microset setpoints? Type YES or NO"
+
+$ReserveMicrosetsEnabled = $false
+if ($reserveMicrosets.ToUpper() -eq "YES") {
+    $ReserveMicrosetsEnabled = $true
+    Write-Host "Microset setpoints will be reserved:"
+    Write-Host "Ignoring AV-90 through AV-110"
+    Write-Host "Ignoring BV-40"
+    Write-Host "Ignoring BV-64 through BV-87"
+}
+
+Write-Host ""
+$designateChangeRange = Read-Host "Would you like to designate the range of values to change? Type YES or NO"
+
+$UseChangeRange = $false
+$ChangeMin = $null
+$ChangeMax = $null
+
+if ($designateChangeRange.ToUpper() -eq "YES") {
+    $UseChangeRange = $true
+
+    $ChangeMin = [int](Read-Host "Enter the LOWEST existing object number to change")
+    $ChangeMax = [int](Read-Host "Enter the HIGHEST existing object number to change")
+
+    Write-Host "Only existing values numbered $ChangeMin through $ChangeMax will be changed."
+}
+
+Write-Host ""
+$designateAssignRange = Read-Host "Would you like to designate the range of values to assign to? Type YES or NO"
+
+$AssignStart = 0
+$AssignEnd = $null
+$UseAssignEnd = $false
+
+if ($designateAssignRange.ToUpper() -eq "YES") {
+    $AssignStart = [int](Read-Host "Enter the FIRST new number to assign")
+
+    $assignEndInput = Read-Host "Enter the LAST new number to assign, or press ENTER for no limit"
+
+    if (-not [string]::IsNullOrWhiteSpace($assignEndInput)) {
+        $AssignEnd = [int]$assignEndInput
+        $UseAssignEnd = $true
+    }
+
+    if ($UseAssignEnd) {
+        Write-Host "New values will be assigned from $AssignStart through $AssignEnd."
+    }
+    else {
+        Write-Host "New values will start at $AssignStart with no upper limit."
+    }
+}
+else {
+    Write-Host "New values will start at 0."
+}
+
+# ------------------------------------------------------------
+# SETUP
+# ------------------------------------------------------------
+
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 
 $ObjectTypes = @("AV", "BV", "AI", "BI", "AO", "BO")
@@ -35,7 +99,7 @@ $ObjectMap = @{}
 $Counters = @{}
 
 foreach ($type in $ObjectTypes) {
-    $Counters[$type] = 0
+    $Counters[$type] = $AssignStart
 }
 
 $timestamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -47,6 +111,39 @@ $backupFile = Join-Path $folder "$baseName`_BACKUP_$timestamp.vsdx"
 $tempFolder = Join-Path $env:TEMP "VisioObjectRenumber_$timestamp"
 $newFile = Join-Path $folder "$baseName`_RENAMED_$timestamp.vsdx"
 $mapFile = Join-Path $folder "ObjectRenumberMap_$timestamp.csv"
+
+function Should-Skip-Object {
+    param (
+        [string]$Type,
+        [int]$Number
+    )
+
+    $Type = $Type.ToUpper()
+
+    # Reserve microset setpoints
+    if ($ReserveMicrosetsEnabled) {
+        if ($Type -eq "AV" -and $Number -ge 90 -and $Number -le 110) {
+            return $true
+        }
+
+        if ($Type -eq "BV" -and $Number -eq 40) {
+            return $true
+        }
+
+        if ($Type -eq "BV" -and $Number -ge 64 -and $Number -le 87) {
+            return $true
+        }
+    }
+
+    # Optional existing-value range filter
+    if ($UseChangeRange) {
+        if ($Number -lt $ChangeMin -or $Number -gt $ChangeMax) {
+            return $true
+        }
+    }
+
+    return $false
+}
 
 function Add-Objects-ToMap {
     param (
@@ -60,10 +157,20 @@ function Add-Objects-ToMap {
     $matches = [regex]::Matches($Text, $Pattern)
 
     foreach ($match in $matches) {
-        $oldValue = $match.Value.ToUpper()
         $type = $match.Groups["Type"].Value.ToUpper()
+        $number = [int]$match.Groups["Number"].Value
+        $oldValue = "$type-$number"
+
+        if (Should-Skip-Object -Type $type -Number $number) {
+            continue
+        }
 
         if (-not $ObjectMap.ContainsKey($oldValue)) {
+
+            if ($UseAssignEnd -and $Counters[$type] -gt $AssignEnd) {
+                throw "Assignment range exceeded for $type. Not enough available numbers between $AssignStart and $AssignEnd."
+            }
+
             $newValue = "$type-$($Counters[$type])"
             $ObjectMap[$oldValue] = $newValue
             $Counters[$type]++
@@ -83,7 +190,9 @@ function Replace-Objects-InText {
     return [regex]::Replace($Text, $Pattern, {
         param($match)
 
-        $oldValue = $match.Value.ToUpper()
+        $type = $match.Groups["Type"].Value.ToUpper()
+        $number = [int]$match.Groups["Number"].Value
+        $oldValue = "$type-$number"
 
         if ($ObjectMap.ContainsKey($oldValue)) {
             return $ObjectMap[$oldValue]
@@ -120,11 +229,11 @@ try {
     }
 
     Write-Host ""
-    Write-Host "Unique objects found: $($ObjectMap.Count)"
+    Write-Host "Unique objects found for renumbering: $($ObjectMap.Count)"
 
     if ($ObjectMap.Count -eq 0) {
         Write-Host ""
-        Write-Host "No AV/BV/AI/BI/AO/BO values were found." -ForegroundColor Yellow
+        Write-Host "No eligible AV/BV/AI/BI/AO/BO values were found." -ForegroundColor Yellow
         Write-Host "Nothing was changed."
         exit
     }
@@ -150,10 +259,20 @@ try {
         $newContent = Replace-Objects-InText -Text $oldContent
 
         if ($newContent -ne $oldContent) {
-            $matchesBefore = [regex]::Matches($oldContent, $Pattern).Count
+            $beforeMatches = [regex]::Matches($oldContent, $Pattern)
+
+            foreach ($m in $beforeMatches) {
+                $type = $m.Groups["Type"].Value.ToUpper()
+                $number = [int]$m.Groups["Number"].Value
+                $oldValue = "$type-$number"
+
+                if ($ObjectMap.ContainsKey($oldValue)) {
+                    $totalReplacements++
+                }
+            }
+
             [System.IO.File]::WriteAllText($file.FullName, $newContent, [System.Text.Encoding]::UTF8)
             $filesChanged++
-            $totalReplacements += $matchesBefore
         }
     }
 
